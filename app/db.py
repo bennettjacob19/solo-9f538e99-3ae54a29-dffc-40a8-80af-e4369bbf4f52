@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS steps (
     UNIQUE(build_id, step_uid),
     FOREIGN KEY(build_id) REFERENCES builds(id)
 );
+CREATE TABLE IF NOT EXISTS verifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_lo    INTEGER NOT NULL,
+    build_hi    INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    lo_size     INTEGER NOT NULL,
+    lo_sha256   TEXT NOT NULL,
+    hi_size     INTEGER NOT NULL,
+    hi_sha256   TEXT NOT NULL,
+    consistent  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE(build_lo, build_hi, path)
+);
 """
 
 
@@ -204,4 +217,84 @@ class Database:
         return await self.all(
             f"SELECT * FROM steps WHERE build_id IN ({placeholders}) ORDER BY id",
             build_ids,
+        )
+
+    # ---- 产物核对 -------------------------------------------------------
+    # 核对结果只插不改：UNIQUE(build_lo, build_hi, path) 保证同一构建对的
+    # 同一路径只确认一份；并发落败方读取已确认的行返回，工作目录后续变化
+    # 不会改写已落库的摘要与结论。
+
+    async def create_verification(
+        self,
+        build_lo: int,
+        build_hi: int,
+        path: str,
+        lo_size: int,
+        lo_sha256: str,
+        hi_size: int,
+        hi_sha256: str,
+        consistent: bool,
+        now: str,
+    ) -> Optional[aiosqlite.Row]:
+        """插入核对结果；冲突（已被并发请求确认）时返回 None。"""
+        assert self._conn is not None
+        cur = await self._conn.execute(
+            """
+            INSERT OR IGNORE INTO verifications
+                (build_lo, build_hi, path, lo_size, lo_sha256,
+                 hi_size, hi_sha256, consistent, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                build_lo,
+                build_hi,
+                path,
+                lo_size,
+                lo_sha256,
+                hi_size,
+                hi_sha256,
+                int(consistent),
+                now,
+            ),
+        )
+        if cur.rowcount == 0:
+            return None
+        return await self.get_verification_by_key(build_lo, build_hi, path)
+
+    async def get_verification(self, verification_id: int) -> Optional[aiosqlite.Row]:
+        return await self.one(
+            "SELECT * FROM verifications WHERE id=?", (verification_id,)
+        )
+
+    async def get_verification_by_key(
+        self, build_lo: int, build_hi: int, path: str
+    ) -> Optional[aiosqlite.Row]:
+        return await self.one(
+            "SELECT * FROM verifications WHERE build_lo=? AND build_hi=? AND path=?",
+            (build_lo, build_hi, path),
+        )
+
+    async def list_verifications(
+        self,
+        pair: Optional[tuple[int, int]] = None,
+        single: Optional[int] = None,
+        path: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[aiosqlite.Row]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if pair is not None:
+            clauses.append("build_lo=? AND build_hi=?")
+            params.extend(pair)
+        elif single is not None:
+            clauses.append("(build_lo=? OR build_hi=?)")
+            params.extend((single, single))
+        if path is not None:
+            clauses.append("path=?")
+            params.append(path)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        return await self.all(
+            f"SELECT * FROM verifications {where} ORDER BY id DESC LIMIT ?",
+            tuple(params),
         )

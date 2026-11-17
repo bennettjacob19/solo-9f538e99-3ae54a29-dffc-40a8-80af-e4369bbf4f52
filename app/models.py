@@ -83,6 +83,37 @@ class CancelOut(BaseModel):
     detail: str
 
 
+class VerificationCreate(BaseModel):
+    """发起产物核对：两个不同的成功构建号 + 工作目录内同一相对路径。"""
+
+    build_a: Annotated[int, Field(ge=1)]
+    build_b: Annotated[int, Field(ge=1)]
+    path: Annotated[str, Field(min_length=1, max_length=512)]
+
+    @field_validator("path")
+    @classmethod
+    def _path_no_nul(cls, v: str) -> str:
+        if "\x00" in v:
+            raise ValueError("路径不允许包含 NUL 字符")
+        return v
+
+
+class VerificationOut(BaseModel):
+    """核对结果。build_a/build_b 按构建号升序归一化（a 为较小号），
+    a_* 对应 build_a 一侧的摘要。"""
+
+    id: int
+    build_a: int
+    build_b: int
+    path: str
+    a_size: int
+    a_sha256: str
+    b_size: int
+    b_sha256: str
+    consistent: bool
+    created_at: str
+
+
 def validate_dag(steps: list[StepIn]) -> None:
     """结构之外的 DAG 语义校验：重复 id、悬空依赖、自依赖、有环。"""
     ids = [s.id for s in steps]

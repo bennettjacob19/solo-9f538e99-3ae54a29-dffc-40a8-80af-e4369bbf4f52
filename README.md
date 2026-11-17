@@ -21,6 +21,13 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 | 未跑步骤不再启动、不误杀后来构建 | 恢复不恢复调度；身份不符（PID 复用）的进程绝不触碰 |
 | 重复取消不改终态 | 终态构建上的取消请求幂等忽略，返回说明，不写库 |
 | 逐步状态与日志 | `GET /builds/{id}` 全量状态；`GET /builds/{id}/steps/{sid}/logs`（支持 `?tail=N`） |
+| 两次构建产物核对 | `POST /verifications`：两个不同的成功构建号 + 工作目录内同一相对路径，返回各自大小、SHA-256 与一致结论 |
+| 越界路径/符号链接不参与核对 | 路径归一化拒绝绝对路径与 `..`；从工作目录根逐分量 `O_NOFOLLOW` 打开，任一分量是符号链接即拒绝 |
+| 读取期间变化/读取失败不确认 | 读取前后 `fstat` 比对 dev/ino/mode/size/mtime/ctime，任一变化或读失败即 409/4xx 且不落库 |
+| 摘要与结论一同持久化 | `verifications` 表同事务写入两侧摘要与结论；`UNIQUE(build_lo, build_hi, path)` |
+| 同一构建对并发只确认一份 | `INSERT OR IGNORE` 抢占，落败并发请求返回已确认的那一份（全库唯一） |
+| 后续工作目录变化不改写结果 | 核对结果只插不改；已确认的构建对直接返回落库结果，不再读工作目录 |
+| 重启后仍可查询 | 结果存于 SQLite（命名卷持久化），`GET /verifications/{id}` / `GET /verifications` 随时可查 |
 
 步骤状态机：`pending → running → cleaning_up → succeeded|failed|cancelled|interrupted`，
 失败后代为 `skipped`。构建终态：全部成功 `succeeded`；有失败 `failed`；
@@ -81,8 +88,35 @@ curl -s -X POST localhost:8000/builds/1/cancel
 | GET | `/builds/{id}` | 构建与全部步骤状态 |
 | POST | `/builds/{id}/cancel` | 整次取消（幂等） |
 | GET | `/builds/{id}/steps/{step_id}/logs?tail=N` | 步骤日志 |
+| POST | `/verifications` | 发起产物核对（201 新确认 / 200 返回已确认结果） |
+| GET | `/verifications?build_a=&build_b=&path=` | 核对结果列表（可按构建对/单构建/路径过滤） |
+| GET | `/verifications/{id}` | 单条核对结果 |
 | GET | `/health` | 健康检查与最近一次启动恢复报告 |
 | GET | `/docs` | Swagger UI |
+
+## 产物核对（可复现性校验）
+
+固件发布工程师提交两个**不同的已成功**构建号与两侧工作目录内**同一相对路径**，
+API 读取两侧普通文件，返回各自大小、SHA-256 与一致结论：
+
+```bash
+curl -s -X POST localhost:8000/verifications \
+  -H 'Content-Type: application/json' \
+  -d '{"build_a": 1, "build_b": 2, "path": "out/fw.bin"}'
+```
+
+语义要点：
+
+- 响应中 `build_a`/`build_b` 按构建号**升序归一化**（`a_*` 对应较小编号一侧），
+  因此 `(1,2)` 与 `(2,1)` 是同一份核对。
+- 路径必须落在构建工作目录内：绝对路径、`..` 越界、空路径一律 400；
+  路径上**任何分量是符号链接**都拒绝参与核对（400），即使指向目录内部。
+- 读取前后各做一次元数据比对（dev/ino/mode/size/mtime/ctime），
+  任一文件在**读取期间变化**或**读取失败**时返回 409/4xx，**不确认结果、不落库**。
+- 两侧摘要与结论一同写入 SQLite；`UNIQUE(build_lo, build_hi, path)` 保证
+  **同一构建对同一路径的并发请求只确认一份结果**，其余并发请求拿到同一条记录。
+- 结果**只插不改**：确认之后工作目录再被改动，重复发起仍返回原确认结果（200），
+  重启服务后仍可通过 `GET /verifications/{id}` 查询。
 
 ## 进程组与重启恢复的关键设计
 
@@ -107,6 +141,9 @@ curl -s -X POST localhost:8000/builds/1/cancel
 - `tests/test_integration.py`：以真实 uvicorn 子进程端到端验证成功、失败跳过、
   慢子进程清理判失败、超时、并行上限 2、整次取消、重复取消幂等、慢清理不占
   另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口。
+- `tests/test_verification.py`：产物核对全链路 —— 一致/不一致结论、并发只确认
+  一份、确认后工作目录篡改不改写结果、重启后可查询、越界路径/符号链接/目录/
+  非成功构建等拒绝路径，以及路径归一化与读期间变化检测的单元测试。
 
 ## 配置（环境变量）
 
